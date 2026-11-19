@@ -1,27 +1,47 @@
 /*
- * Handheld Exercise Tracker
+ * Dose Coach - Handheld Exercise Tracker (final build)
  * Arduino UNO R4 Minima + Grove Base Shield (switch set to 5V)
  *
  * WIRING
  *   Grove-LCD RGB Backlight V4.0 -> any socket labelled I2C on the shield
  *   Grove Buzzer                 -> socket D8
- *   Grove LED Socket + red LED   -> socket D5   (warning light)
- *   Button A                     -> pin D2, other side to GND
+ *   Grove Touch Sensor (TAP pad) -> socket D6   (main control, touched = HIGH)
+ *   Button A                     -> pin D2, other side to GND (backup for the TAP pad)
  *   Button B                     -> pin D3, other side to GND
  *   Button C                     -> pin D4, other side to GND
- *   Green LED                    -> pin D7, through the 220 ohm resistor, to GND
+ *   Status LED                   -> pin D7, through a 220 ohm resistor, to GND
+ *   Red LED (warning light)      -> pin D5, through a 220 ohm resistor, to GND
+ *                                   (on the breadboard; the Grove D5 socket stays empty)
  *   Connect to diagonally opposite legs on each button.
+ *   Wrist sensor (MMA7361):
+ *     sensor 5V  -> Arduino 5V        sensor SL -> sensor 3V3 (jumper on the sensor)
+ *     sensor X   -> A0                sensor Y  -> A1
+ *     sensor Z   -> A2                sensor GND -> GND next to Vin
+ *     GS, ST, 0G -> nothing
  *
  * CONTROLS
- *   Button A : start / pause / resume a timer, or count one rep
- *              skip rest, or go to the next exercise when DONE
+ *   TAP pad or Button A : start / pause / resume a timer, or count one rep,
+ *                         skip rest, or go to the next exercise when DONE.
+ *                         In a sensor exercise (S): the first tap starts the set
+ *                         and saves "arm down"; after that, extra taps add a rep
+ *                         by hand (a backup if the sensor misses one).
  *   Button B : short press = next exercise, long press = previous exercise
  *   Button C : short press = restart exercise, long press = sound on/off
  *
  * LIGHTS
- *   Green (D7) : flashes with every beep, stays on when the exercise is done
- *   Red   (D5) : flashes when a rest is cut short,
- *                stays on during an extra round of an exercise already finished
+ *   Status LED (D7) : flashes with every beep, stays on when the exercise is done
+ *   Red LED (D5)    : flashes for a warning (bad rep, rest cut, sensor problem),
+ *                     stays on during an extra round of an exercise already finished
+ *
+ * SENSOR REPS (mode S, bicep curls)
+ *   The angle is how far the forearm has swung up from "arm down" (0 degrees).
+ *   A movement starts above 40 deg and ends below 25 deg. Then:
+ *     reached 100 deg, took 1.5 s or more   -> counted              (short beep)
+ *     reached 100 deg, took under 1.5 s     -> counted, "Too fast"  (red flash, warning beep)
+ *     under 100 deg, arm swung fast         -> NOT counted, "Too fast"
+ *     under 100 deg, normal speed           -> NOT counted, "Go higher"
+ *   If the sensor reads impossible values for 1 s, the screen says "Sensor?",
+ *   the red LED flashes, and taps count the reps instead. "Sensor OK" when it is back.
  *
  * WORKOUT
  *   The exercise list is in workout.h. Lines with a mistake are skipped, and
@@ -29,8 +49,14 @@
  *
  * LOG
  *   Every set is printed to Serial Monitor as one CSV row:
- *     time_s,exercise,activity,set,target,done,took_s,note
+ *     time_s,exercise,activity,set,target,done,took_s,note,
+ *     counted_by,partial,too_fast,avg_peak_deg,avg_rep_s
  *   note is: ok, extra, stopped, left early, or rest cut.
+ *   counted_by: sensor, tap, mixed (both), or - (timer and rest rows)
+ *   partial: movements NOT counted because they stayed under 100 degrees
+ *   too_fast: counted reps that were too fast
+ *   avg_peak_deg, avg_rep_s: averages over every movement the sensor judged in
+ *   that set (empty when the sensor judged none)
  *   Lines starting with # are status messages, not part of the log.
  *
  * No LCD library is needed. This board's SCL line has no working pull-up, so
@@ -40,6 +66,7 @@
  * Open Serial Monitor at 115200 baud.
  */
 
+#include <math.h>
 #include "workout.h"
 
 // ---------- pins ----------
@@ -47,32 +74,80 @@ const uint8_t PIN_BTN_A     = 2;
 const uint8_t PIN_BTN_B     = 3;
 const uint8_t PIN_BTN_C     = 4;
 const uint8_t PIN_RED_LED   = 5;
-const uint8_t PIN_GREEN_LED = 7;
+const uint8_t PIN_TOUCH     = 6;
+const uint8_t PIN_GREEN_LED = 7;           // the status LED (yellow or green)
 const uint8_t PIN_BUZZER    = 8;
 const uint8_t PIN_LCD_SDA   = A4;
 const uint8_t PIN_LCD_SCL   = A5;
+const uint8_t PIN_AXIS[3]   = {A0, A1, A2};   // sensor X, Y, Z
+const char    AXIS_NAME[3]  = {'X', 'Y', 'Z'};
+
+// ---------- switches ----------
+const bool USE_TOUCH     = true;    // false = ignore the TAP pad. Set this if the pad is
+                                    // unplugged: its pin then "floats" and reads random taps.
+const bool PRINT_BUTTONS = false;   // true = print each button press (wiring test)
+const bool PRINT_REPS    = true;    // true = print a # line for every sensor movement
 
 const uint8_t  LCD_TEXT_ADDRESS  = 0x3E;   // text chip on the Grove LCD
 const uint8_t  LCD_LIGHT_ADDRESS = 0x62;   // backlight chip on the V4.0 board
 const uint16_t LCD_RETRY_MS    = 3000;
 const uint16_t DEBOUNCE_MS     = 30;
 const uint16_t LONG_PRESS_MS   = 800;
+const uint16_t HELD_REPORT_MS  = 5000;     // a press held this long is reported once
 const uint16_t MESSAGE_MS      = 1200;
 const uint16_t WARNING_MS      = 3000;
-const bool     PRINT_BUTTONS   = false;    // true = print each button press (wiring test)
 
 const uint8_t MAX_EXERCISES = 30;
 const uint8_t NAME_LENGTH   = 16;          // fits one LCD line
 
+// ---------- rep rules (tuned with CurlTest) ----------
+const float    REP_START_DEG  = 40.0;   // a movement starts when the angle rises above this
+const float    REP_TOP_DEG    = 100.0;  // it must reach this to count
+const float    REP_END_DEG    = 25.0;   // it ends when the angle drops below this
+const uint16_t TOO_FAST_MS    = 1500;   // a counted rep shorter than this is "Too fast"
+const uint16_t BUMP_MS        = 300;    // shorter than this = a bump or knock, ignored
+const float    FAST_DEG_PER_S = 450;    // arm speed above this = a fast swing
+                                        // (Nov 18 test: slow full curls 275-330 deg/s, fast 785, halves 142-362)
+// The gap between 40 and 25 degrees stops one wobbly rep from counting twice.
+// A movement's time runs from leaving 25 degrees on the way up to dropping
+// back below 25 degrees, so it is close to the whole rep.
+
+// ---------- sensor calibration (measured Nov 6) ----------
+const float ZERO_VOLTS[3]  = {1.67, 1.87, 1.47};  // output voltage at 0 g, per axis
+const float VOLTS_PER_G[3] = {0.83, 0.80, 0.78};  // change in voltage per 1 g, per axis
+const float ADC_VOLTS = 5.0;     // the ADC (analog-to-digital converter) measures against 5 V
+const float ADC_STEPS = 4095.0;  // 12-bit reading: 0 ... 4095
+
+// ---------- sensor reading and smoothing (noise handling) ----------
+const uint8_t  SAMPLES_PER_AXIS = 16;   // each reading = average of 16 samples per axis
+const uint16_t READ_EVERY_MS    = 20;   // one averaged reading every 20 ms (50 per second)
+const float    SMOOTHING        = 0.3;  // 0-1: how much each new reading counts
+
+// ---------- sensor health check ----------
+const float    MIN_GOOD_VOLTS = 0.15;   // the chip runs on 3.3 V: outside 0.15-3.20 V
+const float    MAX_GOOD_VOLTS = 3.20;   //   means a loose wire or Sleep not at 3.3 V
+const float    MIN_GOOD_G     = 0.4;    // a real arm doing curls stays inside 0.4-2.5 g
+const float    MAX_GOOD_G     = 2.5;
+const float    SAME_VOLTS     = 0.03;   // all 3 axes this close = pins floating (unplugged)
+const uint16_t BAD_FOR_MS     = 1000;   // bad this long  -> "Sensor?"
+const uint16_t GOOD_FOR_MS    = 500;    // good this long -> "Sensor OK"
+
+// ---------- saving "arm down" ----------
+const uint16_t ZERO_MS           = 500;   // average the hanging arm over this long
+const float    ZERO_MAX_SPREAD_G = 0.15;  // an axis moving more than this = arm not still
+const float    ZERO_MIN_G        = 0.8;   // a still arm reads close to 1 g in total
+const float    ZERO_MAX_G        = 1.2;
+
 // ---------- types ----------
-enum Mode : uint8_t { TIMER, REPS };
+enum Mode : uint8_t { TIMER, REPS, SENSOR };
 enum State : uint8_t { READY, RUNNING, PAUSED, RESTING, DONE };
 enum Press : uint8_t { NO_PRESS, SHORT_PRESS, LONG_PRESS };
+enum RepResult : uint8_t { NO_REP, REP_GOOD, REP_TOO_FAST, REP_FAST_LOW, REP_TOO_LOW, REP_BUMP };
 
 struct Exercise {
   char     name[NAME_LENGTH + 1];
-  Mode     mode;     // TIMER or REPS
-  uint16_t target;   // seconds for TIMER, reps for REPS
+  Mode     mode;     // TIMER, REPS or SENSOR
+  uint16_t target;   // seconds for TIMER, reps for REPS and SENSOR
   uint8_t  sets;
   uint16_t rest;     // seconds between sets
 };
@@ -80,10 +155,23 @@ struct Exercise {
 struct Button {
   uint8_t  pin;
   const char *label;
+  bool     activeHigh;   // true: HIGH = pressed (TAP pad). false: LOW = pressed (buttons)
   bool     down;
   bool     longSent;
+  bool     heldReported;
   uint32_t changedAt;
   uint32_t pressedAt;
+};
+
+// Quality numbers for the set in progress (sensor exercises).
+struct SetStats {
+  uint16_t sensorReps;   // reps counted by the sensor
+  uint16_t tapReps;      // reps counted by a tap
+  uint16_t partial;      // movements not counted (under 100 degrees)
+  uint16_t tooFast;      // counted reps that were too fast
+  uint16_t moves;        // every movement the sensor judged
+  float    peakSum;      // for the average peak angle
+  uint32_t msSum;        // for the average rep time
 };
 
 // ---------- sounds: on, off, on, off ... ending in 0 (milliseconds) ----------
@@ -103,9 +191,11 @@ uint8_t  exerciseCount = 0;
 uint8_t  workoutErrors = 0;
 bool     finished[MAX_EXERCISES];      // exercise completed this session
 
-Button btnA = {PIN_BTN_A, "A (D2)", false, false, 0, 0};
-Button btnB = {PIN_BTN_B, "B (D3)", false, false, 0, 0};
-Button btnC = {PIN_BTN_C, "C (D4)", false, false, 0, 0};
+Button btnA   = {PIN_BTN_A, "A (D2)",       false, false, false, false, 0, 0};
+Button btnB   = {PIN_BTN_B, "B (D3)",       false, false, false, false, 0, 0};
+Button btnC   = {PIN_BTN_C, "C (D4)",       false, false, false, false, 0, 0};
+Button btnPad = {PIN_TOUCH, "TAP pad (D6)", true,  false, false, false, 0, 0};
+bool   padProbeHigh = false;           // startup plug-in check of the TAP pad
 
 uint8_t  exerciseIndex = 0;
 State    state = READY;
@@ -117,6 +207,7 @@ uint16_t lastSecond = 0;
 uint32_t setStartedAt = 0;
 bool     extraRound = false;           // repeating an exercise already done
 uint32_t warningUntil = 0;
+SetStats stats;
 
 bool     muted = false;
 const char *message = "";
@@ -127,7 +218,56 @@ uint8_t  soundStep = 0;
 uint32_t nextSoundStep = 0;
 bool     soundOn = false;
 
+// sensor readings
+float volts[3]   = {0, 0, 0};          // latest averaged voltage, per axis
+float rawG[3]    = {0, 0, 0};          // latest reading in g (not smoothed)
+float smoothG[3] = {0, 0, 0};          // smoothed reading in g
+bool  haveSmooth = false;
+float totalG     = 0;                  // length of the smoothed gravity arrow, in g
+float angleDeg   = 0;                  // angle from "arm down", in degrees
+uint32_t lastReadAt = 0;
+uint32_t firstReadAt = 0;             // when the sensor was first read (0 = not yet)
+
+// sensor health. Assumed OK at power-up; 1 s of bad readings proves otherwise.
+bool        sensorOk    = true;
+bool        badRunning  = false;
+bool        goodRunning = false;
+uint32_t    badSince    = 0;
+uint32_t    goodSince   = 0;
+const char *lastProblem = "";
+
+// "arm down" reference, saved at the start of every sensor set
+bool     haveRef = false;
+float    ref[3]  = {0, 0, 0};          // unit-length arrow: gravity direction with arm down
+bool     zeroing = false;
+uint32_t zeroStartedAt = 0;
+uint16_t zeroCount = 0;
+float    zeroSum[3], zeroMin[3], zeroMax[3];
+
+// rep checker
+bool     armUp = false;                // inside a movement (angle went above 40)
+uint32_t moveStartedAt = 0;
+uint32_t lastBelowEndAt = 0;
+float    movePeak = 0;
+float    moveTopSpeed = 0;
+float    lastPeak = 0;
+uint32_t lastTookMs = 0;
+float    recentAngles[4] = {0, 0, 0, 0};   // last 4 angles and their times, for the speed
+uint32_t recentAt[4] = {0, 0, 0, 0};
+uint8_t  recentIndex = 0;
+float    armSpeed = 0;                     // degrees per second
+
 const Exercise &current() { return workout[exerciseIndex]; }
+
+// Written further down; declared here so earlier functions can call them.
+void startZeroing();
+void finishSet();
+
+// True while the current exercise is a sensor exercise and a set is running.
+bool inSensorSet() { return exerciseCount > 0 && current().mode == SENSOR && state == RUNNING; }
+
+// True when the sensor can't be used for this set, so taps count the reps.
+bool countingByTaps() { return inSensorSet() && (!sensorOk || !haveRef); }
 
 // ---------- reading workout.h ----------
 char *trimSpaces(char *text) {
@@ -184,11 +324,12 @@ const char *parseLine(char *line, Exercise &out, bool &isExercise) {
   if (length > NAME_LENGTH) return "name is longer than 16 characters";
   strcpy(out.name, name);
 
-  if (strlen(mode) != 1) return "mode must be T or C";
+  if (strlen(mode) != 1) return "mode must be T, C or S";
   char m = mode[0];
   if (m == 'T' || m == 't') out.mode = TIMER;
   else if (m == 'C' || m == 'c') out.mode = REPS;
-  else return "mode must be T or C";
+  else if (m == 'S' || m == 's') out.mode = SENSOR;
+  else return "mode must be T, C or S";
 
   if (out.mode == TIMER) {
     if (!readNumber(target, 1, 5999, out.target)) return "timer target must be 1-5999 seconds";
@@ -260,7 +401,7 @@ uint8_t readWorkout(bool keep, bool report) {
 
 // ---------- sound and lights (never blocks) ----------
 void setOutputs(bool on) {
-  soundOn = on;                                   // green LED follows the sound
+  soundOn = on;                                   // status LED follows the sound
   digitalWrite(PIN_BUZZER, (on && !muted) ? HIGH : LOW);
 }
 
@@ -319,11 +460,34 @@ void startCountdown(uint32_t ms) {
 
 // ---------- CSV log ----------
 void printLogHeader() {
-  Serial.println(F("time_s,exercise,activity,set,target,done,took_s,note"));
+  Serial.println(F("time_s,exercise,activity,set,target,done,took_s,note,"
+                   "counted_by,partial,too_fast,avg_peak_deg,avg_rep_s"));
 }
 
+// The five quality columns at the end of a row.
+void printQualityColumns(bool forThisSet) {
+  if (!forThisSet || current().mode == TIMER) { Serial.println(F("-,0,0,,")); return; }
+  if (current().mode == REPS)                 { Serial.println(F("tap,0,0,,")); return; }
+
+  if (stats.sensorReps > 0 && stats.tapReps > 0) Serial.print(F("mixed"));
+  else if (stats.sensorReps > 0)                 Serial.print(F("sensor"));
+  else if (stats.tapReps > 0)                    Serial.print(F("tap"));
+  else                                           Serial.print(F("-"));
+  Serial.print(',');
+  Serial.print(stats.partial);  Serial.print(',');
+  Serial.print(stats.tooFast);  Serial.print(',');
+  if (stats.moves > 0) {
+    Serial.print(stats.peakSum / stats.moves, 0);
+    Serial.print(',');
+    Serial.println(stats.msSum / 1000.0 / stats.moves, 1);
+  } else {
+    Serial.println(',');                      // both averages empty
+  }
+}
+
+// forThisSet = false for rest rows and for sets that never started.
 void logRow(const char *activity, uint8_t set, uint16_t target, uint16_t done,
-            uint32_t took, const char *note) {
+            uint32_t took, const char *note, bool forThisSet) {
   Serial.print(millis() / 1000);   Serial.print(',');
   Serial.print(current().name);    Serial.print(',');
   Serial.print(activity);          Serial.print(',');
@@ -332,14 +496,19 @@ void logRow(const char *activity, uint8_t set, uint16_t target, uint16_t done,
   Serial.print(target);            Serial.print(',');
   Serial.print(done);              Serial.print(',');
   Serial.print(took);              Serial.print(',');
-  Serial.println(note);
+  Serial.print(note);              Serial.print(',');
+  printQualityColumns(forThisSet);
 }
 
-const char *activityName() { return current().mode == TIMER ? "timer" : "reps"; }
+const char *activityName() {
+  if (current().mode == TIMER) return "timer";
+  if (current().mode == SENSOR) return "sensor reps";
+  return "reps";
+}
 
 // Reps counted, or whole seconds the timer has run, in the current set.
 uint16_t doneSoFar() {
-  if (current().mode == REPS) return repCount;
+  if (current().mode != TIMER) return repCount;
   uint32_t total = (uint32_t)current().target * 1000UL;
   uint32_t left = timeLeftMs();
   return (uint16_t)((total - (left < total ? left : total)) / 1000);
@@ -351,17 +520,21 @@ uint32_t setSeconds() { return (millis() - setStartedAt) / 1000; }
 void logIfLeftEarly() {
   if (exerciseCount == 0 || state == DONE) return;
   if (state == RUNNING || state == PAUSED) {
-    logRow(activityName(), setNumber, current().target, doneSoFar(), setSeconds(), "stopped");
+    logRow(activityName(), setNumber, current().target, doneSoFar(), setSeconds(), "stopped", true);
   } else if (state == RESTING) {
-    logRow(activityName(), setNumber + 1, current().target, 0, 0, "left early");
+    logRow(activityName(), setNumber + 1, current().target, 0, 0, "left early", false);
   } else if (setNumber > 1) {
-    logRow(activityName(), setNumber, current().target, 0, 0, "left early");
+    logRow(activityName(), setNumber, current().target, 0, 0, "left early", false);
   }
 }
 
 void prepareSet() {
   repCount = 0;
   state = READY;
+  memset(&stats, 0, sizeof stats);
+  haveRef = false;                      // every sensor set saves its own "arm down"
+  zeroing = false;
+  armUp = false;
 }
 
 void goToExercise(int16_t index) {
@@ -382,7 +555,7 @@ void nextSet() {
 
 void finishSet() {
   logRow(activityName(), setNumber, current().target, doneSoFar(), setSeconds(),
-         extraRound ? "extra" : "ok");
+         extraRound ? "extra" : "ok", true);
   if (setNumber >= current().sets) {
     state = DONE;
     finished[exerciseIndex] = true;
@@ -421,9 +594,10 @@ void updateCountdown() {
   }
 }
 
-// ---------- buttons ----------
+// ---------- buttons and the TAP pad ----------
 Press readButton(Button &b) {
-  bool pressed = (digitalRead(b.pin) == LOW);    // INPUT_PULLUP: LOW means pressed
+  bool level   = (digitalRead(b.pin) == HIGH);
+  bool pressed = b.activeHigh ? level : !level;  // buttons use INPUT_PULLUP: LOW = pressed
   uint32_t now = millis();
 
   if (pressed != b.down && now - b.changedAt >= DEBOUNCE_MS) {
@@ -432,6 +606,7 @@ Press readButton(Button &b) {
     if (pressed) {
       b.pressedAt = now;
       b.longSent = false;
+      b.heldReported = false;
       if (PRINT_BUTTONS) {
         Serial.print(F("# Button pressed: "));
         Serial.println(b.label);
@@ -442,13 +617,41 @@ Press readButton(Button &b) {
   } else if (b.down && !b.longSent && now - b.pressedAt >= LONG_PRESS_MS) {
     b.longSent = true;
     return LONG_PRESS;
+  } else if (b.down && !b.heldReported && now - b.pressedAt >= HELD_REPORT_MS) {
+    // Held for 5 s: a stuck button, or a hand resting on the pad. Reported once.
+    b.heldReported = true;
+    Serial.print(F("# "));
+    Serial.print(b.label);
+    Serial.println(F(" held for 5 s: stuck, or a hand resting on it?"));
+    showMessage("Held 5 s?", WARNING_MS);
   }
   return NO_PRESS;
+}
+
+void startSensorSet() {
+  state = RUNNING;
+  setStartedAt = millis();
+  if (finished[exerciseIndex] && !extraRound) {
+    extraRound = true;                      // already did this one today
+    showMessage("Extra!", MESSAGE_MS);
+  }
 }
 
 void handleButtonA() {
   switch (state) {
     case READY:
+      if (current().mode == SENSOR) {
+        if (zeroing) break;                 // already saving "arm down"
+        if (sensorOk) {
+          startZeroing();                   // the set starts once "arm down" is saved
+          playSound(SOUND_CLICK);
+        } else {
+          startSensorSet();                 // no sensor: taps count the reps
+          warn("Sensor?");
+          Serial.println(F("# Sensor not OK: this set counts taps."));
+        }
+        break;
+      }
       state = RUNNING;
       setStartedAt = millis();
       if (finished[exerciseIndex] && !extraRound) {
@@ -470,7 +673,8 @@ void handleButtonA() {
         state = PAUSED;
         playSound(SOUND_CLICK);
       } else {
-        repCount++;
+        repCount++;                           // a rep counted by a tap
+        if (current().mode == SENSOR) stats.tapReps++;
         playSound(SOUND_CLICK);
         if (repCount >= current().target) finishSet();
       }
@@ -484,7 +688,7 @@ void handleButtonA() {
       uint32_t restMs = (uint32_t)current().rest * 1000UL;
       uint32_t left = timeLeftMs();
       uint16_t rested = (uint16_t)((restMs - (left < restMs ? left : restMs)) / 1000);
-      logRow("rest", setNumber, current().rest, rested, rested, "rest cut");
+      logRow("rest", setNumber, current().rest, rested, rested, "rest cut", false);
       nextSet();
       warn("Rest cut");
       break;
@@ -511,6 +715,288 @@ void handleButtonC(Press press) {
     showMessage("Restarted", MESSAGE_MS);
   }
   playSound(SOUND_CLICK);
+}
+
+// Plug-in check for the TAP pad, at power-up. With the pin's pull-up on, an
+// unplugged pin reads HIGH; a plugged-in pad that isn't touched drives it LOW.
+// Only reported in Serial Monitor; USE_TOUCH is the real switch.
+void probeTouchPad() {
+  pinMode(PIN_TOUCH, INPUT_PULLUP);
+  delay(5);
+  padProbeHigh = (digitalRead(PIN_TOUCH) == HIGH);
+  pinMode(PIN_TOUCH, INPUT);
+}
+
+// ---------- wrist sensor ----------
+// Reads each axis 16 times and averages, which cuts random noise by about 4x.
+void readSensorVolts() {
+  for (uint8_t axis = 0; axis < 3; axis++) {
+    uint32_t sum = 0;
+    for (uint8_t i = 0; i < SAMPLES_PER_AXIS; i++) sum += analogRead(PIN_AXIS[axis]);
+    volts[axis] = (sum / (float)SAMPLES_PER_AXIS) * ADC_VOLTS / ADC_STEPS;
+    rawG[axis]  = (volts[axis] - ZERO_VOLTS[axis]) / VOLTS_PER_G[axis];
+  }
+}
+
+float lengthOf(const float v[3]) { return sqrtf(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]); }
+
+// Returns nullptr if the reading looks possible, otherwise a short reason.
+const char *readingProblem() {
+  for (uint8_t axis = 0; axis < 3; axis++) {
+    if (volts[axis] < MIN_GOOD_VOLTS) return "a voltage is near 0 V (loose wire, or Sleep not at 3.3 V)";
+    if (volts[axis] > MAX_GOOD_VOLTS) return "a voltage is above 3.2 V (loose GND wire?)";
+  }
+  float lowest  = fminf(volts[0], fminf(volts[1], volts[2]));
+  float highest = fmaxf(volts[0], fmaxf(volts[1], volts[2]));
+  if (highest - lowest < SAME_VOLTS) return "all 3 axes read the same (sensor unplugged? pins floating)";
+  if (totalG < MIN_GOOD_G) return "total g is too small";
+  if (totalG > MAX_GOOD_G) return "total g is too big";
+  return nullptr;
+}
+
+// Prints e.g. "X 1.66 Y 1.88 Z 2.25 V, total 1.00 g".
+void printSensorValues() {
+  for (uint8_t axis = 0; axis < 3; axis++) {
+    Serial.print(AXIS_NAME[axis]);
+    Serial.print(' ');
+    Serial.print(volts[axis], 2);
+    Serial.print(' ');
+  }
+  Serial.print(F("V, total "));
+  Serial.print(totalG, 2);
+  Serial.println(F(" g"));
+}
+
+// One bad reading is ignored. Bad for 1 s -> "Sensor?". Good for 0.5 s -> "Sensor OK".
+// The two different times stop the message flickering.
+void updateHealth(const char *problem, uint32_t now) {
+  if (problem != nullptr) {
+    lastProblem = problem;
+    goodRunning = false;
+    if (!badRunning) { badRunning = true; badSince = now; }
+    if (sensorOk && now - badSince >= BAD_FOR_MS) {
+      sensorOk = false;
+      armUp = false;                    // drop any half-finished movement
+      if (zeroing) {
+        zeroing = false;                // can't save "arm down" now; next tap starts with taps
+        Serial.println(F("# Arm down NOT saved: sensor problem during the save."));
+      }
+      Serial.print(F("# Sensor? "));
+      Serial.print(problem);
+      Serial.print(F(" | "));
+      printSensorValues();
+      if (exerciseCount > 0 && current().mode == SENSOR && state != DONE) {
+        warn("Sensor?");
+        if (state == RUNNING) Serial.println(F("# Taps count the reps until the sensor is OK."));
+      }
+    }
+  } else {
+    badRunning = false;
+    if (!goodRunning) { goodRunning = true; goodSince = now; }
+    if (!sensorOk && now - goodSince >= GOOD_FOR_MS) {
+      sensorOk = true;
+      Serial.print(F("# Sensor OK | "));
+      printSensorValues();
+      if (exerciseCount > 0 && current().mode == SENSOR && state != DONE) {
+        showMessage("Sensor OK", MESSAGE_MS);
+        playSound(SOUND_CLICK);
+      }
+    }
+  }
+}
+
+// Angle between the current gravity direction and the saved "arm down" direction.
+float angleFromArmDown() {
+  if (!haveRef || totalG < 0.05) return 0;
+  float dot = (smoothG[0] * ref[0] + smoothG[1] * ref[1] + smoothG[2] * ref[2]) / totalG;
+  if (dot > 1) dot = 1;                 // rounding can push it slightly past 1
+  if (dot < -1) dot = -1;
+  return acosf(dot) * 57.29578;         // radians to degrees
+}
+
+// Arm speed: change in angle over the last 3 readings, using their real times
+// (an LCD update can delay a reading a little). When the angle can't be trusted,
+// the memory is filled with the current angle so the next reading isn't a "jump".
+void updateSpeed(bool valid, uint32_t now) {
+  if (!valid) {
+    for (uint8_t i = 0; i < 4; i++) { recentAngles[i] = angleDeg; recentAt[i] = now; }
+    armSpeed = 0;
+    return;
+  }
+  float oldAngle = recentAngles[recentIndex];       // from 3 readings ago
+  uint32_t oldAt = recentAt[recentIndex];
+  recentAngles[recentIndex] = angleDeg;
+  recentAt[recentIndex] = now;
+  recentIndex = (recentIndex + 1) % 4;
+  armSpeed = (now > oldAt) ? fabsf(angleDeg - oldAngle) * 1000.0 / (now - oldAt) : 0;
+}
+
+// ---------- saving "arm down" ----------
+void startZeroing() {
+  zeroing = true;
+  zeroStartedAt = millis();
+  zeroCount = 0;
+  for (uint8_t axis = 0; axis < 3; axis++) {
+    zeroSum[axis] = 0;
+    zeroMin[axis] = 99;
+    zeroMax[axis] = -99;
+  }
+  showMessage("Arm down", ZERO_MS + 300);
+}
+
+// Called with every reading while saving. Uses the unsmoothed readings so the
+// smoothing delay doesn't leak the tap movement into the saved position.
+void updateZeroing(uint32_t now) {
+  for (uint8_t axis = 0; axis < 3; axis++) {
+    zeroSum[axis] += rawG[axis];
+    zeroMin[axis] = fminf(zeroMin[axis], rawG[axis]);
+    zeroMax[axis] = fmaxf(zeroMax[axis], rawG[axis]);
+  }
+  zeroCount++;
+  if (now - zeroStartedAt < ZERO_MS) return;
+  zeroing = false;
+
+  float average[3];
+  float spread = 0;
+  for (uint8_t axis = 0; axis < 3; axis++) {
+    average[axis] = zeroSum[axis] / zeroCount;
+    spread = fmaxf(spread, zeroMax[axis] - zeroMin[axis]);
+  }
+  float total = lengthOf(average);
+  if (spread > ZERO_MAX_SPREAD_G || total < ZERO_MIN_G || total > ZERO_MAX_G) {
+    Serial.println(F("# Arm down NOT saved: arm moved, or total not near 1 g. Tap again."));
+    warn("Tap again");
+    return;                             // stays READY: the next tap tries again
+  }
+  for (uint8_t axis = 0; axis < 3; axis++) ref[axis] = average[axis] / total;
+  haveRef = true;
+  armUp = false;
+  startSensorSet();
+  playSound(SOUND_START);
+  showMessage("Go!", MESSAGE_MS);
+  Serial.println(F("# Arm down saved as 0 deg. Set started."));
+}
+
+// ---------- rep checker ----------
+// Called with every new angle. Returns what happened when a movement ends.
+RepResult checkRep(float angle, float speed, uint32_t now) {
+  if (!armUp) {
+    if (angle < REP_END_DEG) lastBelowEndAt = now;
+    if (angle > REP_START_DEG) {        // movement starts
+      armUp = true;
+      moveStartedAt = lastBelowEndAt;
+      movePeak = angle;
+      moveTopSpeed = speed;
+    }
+    return NO_REP;
+  }
+
+  if (angle > movePeak) movePeak = angle;
+  if (speed > moveTopSpeed) moveTopSpeed = speed;
+  if (angle >= REP_END_DEG) return NO_REP;   // still up
+
+  // The arm came back below 25 degrees: the movement is over.
+  armUp = false;
+  lastBelowEndAt = now;
+  lastPeak = movePeak;
+  lastTookMs = now - moveStartedAt;
+  bool high = (movePeak >= REP_TOP_DEG);
+  if (lastTookMs < BUMP_MS)              return REP_BUMP;
+  if (high && lastTookMs >= TOO_FAST_MS) return REP_GOOD;
+  if (high)                              return REP_TOO_FAST;   // counted, but flagged
+  // Under 100 degrees. If the arm was swinging fast, that height can't be trusted:
+  // at the top of a fast curl the arm brakes hard and the sensor feels the braking
+  // as extra tilt, so the angle reads 20-40 degrees too low. "Slow down" is the
+  // right advice either way, so it is "Too fast" (and not counted).
+  if (moveTopSpeed > FAST_DEG_PER_S)     return REP_FAST_LOW;
+  return REP_TOO_LOW;
+}
+
+void printRepLine(const __FlashStringHelper *verdict) {
+  if (!PRINT_REPS) return;
+  Serial.print(F("# rep check: "));
+  Serial.print(verdict);
+  Serial.print(F(" peak "));
+  Serial.print(lastPeak, 0);
+  Serial.print(F(" deg, took "));
+  Serial.print(lastTookMs / 1000.0, 1);
+  Serial.print(F(" s, top speed "));
+  Serial.print(moveTopSpeed, 0);
+  Serial.print(F(" deg/s, count "));
+  Serial.print(repCount);
+  Serial.print('/');
+  Serial.println(current().target);
+}
+
+// What happens after a movement ends: count it or not, and give feedback.
+void handleRep(RepResult result) {
+  if (result == NO_REP) return;
+  if (result == REP_BUMP) {
+    if (PRINT_REPS) Serial.println(F("# rep check: bump ignored"));
+    return;
+  }
+  stats.moves++;
+  stats.peakSum += lastPeak;
+  stats.msSum += lastTookMs;
+
+  switch (result) {
+    case REP_GOOD:
+      repCount++;
+      stats.sensorReps++;
+      playSound(SOUND_TICK);
+      printRepLine(F("good,"));
+      break;
+    case REP_TOO_FAST:
+      repCount++;
+      stats.sensorReps++;
+      stats.tooFast++;
+      warn("Too fast");
+      printRepLine(F("TOO FAST (counted),"));
+      break;
+    case REP_FAST_LOW:
+      stats.partial++;
+      warn("Too fast");
+      printRepLine(F("TOO FAST (not counted, under 100 deg),"));
+      break;
+    default:                            // REP_TOO_LOW
+      stats.partial++;
+      warn("Go higher");
+      printRepLine(F("GO HIGHER (not counted),"));
+      break;
+  }
+  if (repCount >= current().target) finishSet();
+}
+
+// One sensor reading, every 20 ms, whatever the exercise (so the health check
+// always knows the sensor's state). Reps are only checked during a sensor set.
+void updateSensor() {
+  uint32_t now = millis();
+  if (now - lastReadAt < READ_EVERY_MS) return;
+  lastReadAt = now;
+  if (firstReadAt == 0) firstReadAt = now;
+
+  readSensorVolts();
+  // Light smoothing: move part of the way (30%) toward each new reading.
+  for (uint8_t axis = 0; axis < 3; axis++) {
+    if (!haveSmooth) smoothG[axis] = rawG[axis];
+    else smoothG[axis] += SMOOTHING * (rawG[axis] - smoothG[axis]);
+  }
+  haveSmooth = true;
+  totalG   = lengthOf(smoothG);
+  angleDeg = angleFromArmDown();
+
+  updateHealth(readingProblem(), now);
+
+  if (exerciseCount == 0) return;
+  if (zeroing) {
+    if (sensorOk) updateZeroing(now);
+    updateSpeed(false, now);
+    return;
+  }
+  bool angleValid = inSensorSet() && sensorOk && haveRef;
+  updateSpeed(angleValid, now);
+  if (angleValid) handleRep(checkRep(angleDeg, armSpeed, now));
+  else armUp = false;
 }
 
 // ---------- LCD ----------
@@ -662,6 +1148,8 @@ void updateScreen() {
     snprintf(status, sizeof status, "REST>S%u", setNumber + 1);
   } else if (state == PAUSED) {
     strcpy(status, "PAUSED");
+  } else if (countingByTaps()) {
+    strcpy(status, "Tap reps");               // sensor set, but taps are counting
   } else if (state != DONE) {
     snprintf(status, sizeof status, extraRound ? "Extra %u/%u" : "Set %u/%u",
              setNumber, current().sets);
@@ -698,6 +1186,33 @@ void printProbes() {
 void printReport() {
   Serial.println(F("# --- Exercise Tracker ---"));
   printProbes();
+
+  if (!USE_TOUCH) {
+    Serial.println(F("# TAP pad: ignored (USE_TOUCH = false). Use button A."));
+  } else if (padProbeHigh) {
+    Serial.println(F("# TAP pad: pin read HIGH at power-up -> looks UNPLUGGED (or was touched)."));
+    Serial.println(F("#   If it really is unplugged, set USE_TOUCH = false."));
+  } else {
+    Serial.println(F("# TAP pad: looks plugged in."));
+  }
+
+  Serial.print(sensorOk ? F("# Wrist sensor: OK | ") : F("# Wrist sensor: NOT OK | "));
+  printSensorValues();
+  if (!sensorOk) {
+    Serial.print(F("#   reason: "));
+    Serial.println(lastProblem);
+    Serial.println(F("#   Sensor exercises will count taps until it reads OK."));
+  }
+  Serial.print(F("# Rep rules: start above "));
+  Serial.print(REP_START_DEG, 0);
+  Serial.print(F(" deg, count at "));
+  Serial.print(REP_TOP_DEG, 0);
+  Serial.print(F(" deg, end below "));
+  Serial.print(REP_END_DEG, 0);
+  Serial.print(F(" deg, too fast under "));
+  Serial.print(TOO_FAST_MS / 1000.0, 1);
+  Serial.println(F(" s"));
+
   Serial.print(F("# Exercises loaded from workout.h: "));
   Serial.println(exerciseCount);
   for (uint8_t i = 0; i < exerciseCount; i++) {
@@ -710,7 +1225,9 @@ void printReport() {
     Serial.print(e.sets);
     Serial.print(F(" x "));
     Serial.print(e.target);
-    Serial.print(e.mode == TIMER ? F(" s") : F(" reps"));
+    if (e.mode == TIMER)       Serial.print(F(" s"));
+    else if (e.mode == SENSOR) Serial.print(F(" reps (wrist sensor)"));
+    else                       Serial.print(F(" reps"));
     Serial.print(F(", rest "));
     Serial.print(e.rest);
     Serial.println(F(" s"));
@@ -726,6 +1243,8 @@ void setup() {
   pinMode(PIN_BTN_A, INPUT_PULLUP);
   pinMode(PIN_BTN_B, INPUT_PULLUP);
   pinMode(PIN_BTN_C, INPUT_PULLUP);
+  probeTouchPad();                          // leaves the pin as a plain INPUT
+  analogReadResolution(12);                 // UNO R4: 0-4095 instead of 0-1023
 
   Serial.begin(115200);
   workoutErrors = readWorkout(true, false);
@@ -758,9 +1277,11 @@ void loop() {
     }
   }
 
-  // Once Serial Monitor is open: report, then the CSV header.
+  // Once Serial Monitor is open: report, then the CSV header. It waits until the
+  // sensor has been read for over 1 s, so the report shows its real state.
   static bool reported = false;
-  if (!reported && (bool)Serial) {
+  bool sensorChecked = firstReadAt != 0 && millis() - firstReadAt > BAD_FOR_MS + 200;
+  if (!reported && (bool)Serial && (sensorChecked || exerciseCount == 0)) {
     reported = true;
     printReport();
     printLogHeader();
@@ -773,8 +1294,14 @@ void loop() {
     return;
   }
 
+  // The TAP pad and button A do exactly the same thing.
   Press a = readButton(btnA);
   if (a == SHORT_PRESS || a == LONG_PRESS) handleButtonA();
+
+  if (USE_TOUCH) {
+    Press pad = readButton(btnPad);
+    if (pad == SHORT_PRESS || pad == LONG_PRESS) handleButtonA();
+  }
 
   Press b = readButton(btnB);
   if (b != NO_PRESS) handleButtonB(b);
@@ -782,6 +1309,7 @@ void loop() {
   Press c = readButton(btnC);
   if (c != NO_PRESS) handleButtonC(c);
 
+  updateSensor();
   updateCountdown();
   updateSound();
   updateLights();
