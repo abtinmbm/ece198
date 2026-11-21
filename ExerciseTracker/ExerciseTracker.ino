@@ -241,7 +241,10 @@ bool     extraRound = false;           // repeating an exercise already done
 uint32_t warningUntil = 0;
 SetStats stats;
 uint16_t exReps = 0;                   // reps counted in this exercise (all sets)
-uint16_t exGood = 0;                   // of those, good sensor reps
+uint16_t exGood = 0;                   // good sensor reps in this exercise
+uint16_t exTries = 0;                  // every rep tried: counted ones plus ones not counted
+uint16_t wkReps = 0;                   // whole workout: reps tried in finished sensor exercises
+uint16_t wkGood = 0;                   // of those, good reps (for the "Workout done!" screen)
 uint32_t celebrateUntil = 0;           // end of the "WELL DONE!" animation
 uint32_t tapsIgnoredUntil = 0;         // TAP pad and button A ignored until then
 char     shownLine[2][17];             // what is on the LCD now (for partial redraws)
@@ -305,6 +308,13 @@ void forgetScreen();
 
 // True while the current exercise is a sensor exercise and a set is running.
 bool inSensorSet() { return exerciseCount > 0 && current().mode == SENSOR && state == RUNNING; }
+
+// True when every exercise in the plan has been finished this round.
+bool workoutComplete() {
+  if (exerciseCount == 0) return false;
+  for (uint8_t i = 0; i < exerciseCount; i++) if (!finished[i]) return false;
+  return true;
+}
 
 // True when the sensor can't be used for this set, so taps count the reps.
 bool countingByTaps() { return inSensorSet() && (!sensorOk || !haveRef); }
@@ -586,7 +596,7 @@ void goToExercise(int16_t index) {
   exerciseIndex = (uint8_t)index;
   setNumber = 1;
   extraRound = false;
-  exReps = exGood = 0;
+  exReps = exGood = exTries = 0;
   celebrateUntil = 0;
   prepareSet();
   playSound(SOUND_CLICK);
@@ -602,12 +612,32 @@ void finishSet() {
          extraRound ? "extra" : "ok", true);
   exReps += doneSoFar();
   exGood += stats.sensorReps - stats.tooFast;
+  exTries += doneSoFar() + stats.partial;
   tapsIgnoredUntil = millis() + TAP_GUARD_MS;
   if (setNumber >= current().sets) {
     state = DONE;
     finished[exerciseIndex] = true;
+    if (current().mode == SENSOR) {           // add this exercise to the workout totals
+      wkReps += exTries;
+      wkGood += exGood;
+    }
     celebrateUntil = millis() + CELEBRATE_MS;   // start the "WELL DONE!" screen
     playSound(SOUND_FINISH);
+    if (workoutComplete()) {
+      Serial.print(F("# Workout complete: all "));
+      Serial.print(exerciseCount);
+      Serial.print(F(" exercises done"));
+      if (wkReps > 0) {
+        Serial.print(F(", good reps "));
+        Serial.print(wkGood);
+        Serial.print('/');
+        Serial.print(wkReps);
+        Serial.print(F(" ("));
+        Serial.print(100UL * wkGood / wkReps);
+        Serial.print(F(" %)"));
+      }
+      Serial.println('.');
+    }
   } else if (current().rest > 0) {
     state = RESTING;
     startCountdown((uint32_t)current().rest * 1000UL);
@@ -748,6 +778,7 @@ void handleButtonA() {
         // Whole workout done: start a fresh round from the top, so the
         // exercises aren't all marked "Extra" (red LED on) the second time.
         for (uint8_t i = 0; i < exerciseCount; i++) finished[i] = false;
+        wkReps = wkGood = 0;
         Serial.println(F("# Workout complete. Starting a new round from the first exercise."));
         goToExercise(0);
         showMessage("New round", MESSAGE_MS);
@@ -770,7 +801,7 @@ void handleButtonC(Press press) {
     logIfLeftEarly();
     setNumber = 1;
     extraRound = false;
-    exReps = exGood = 0;
+    exReps = exGood = exTries = 0;
     celebrateUntil = 0;
     prepareSet();
     showMessage("Restarted", MESSAGE_MS);
@@ -1300,10 +1331,24 @@ void buildScreen(char *line1, char *line2, uint32_t now) {
     } else if (e.mode == TIMER) {
       snprintf(line2, 17, "%u set%s done     ", e.sets, e.sets == 1 ? "" : "s");
     } else if (e.mode == SENSOR) {
-      snprintf(line2, 17, "%u good of %u     ", exGood, exReps);
+      snprintf(line2, 17, "%u good of %u     ", exGood, exTries);   // out of every rep tried
     } else {
       snprintf(line2, 17, "%u reps done      ", exReps);
     }
+    return;
+  }
+
+  // ---- whole plan finished: a summary, taking turns with what to do next
+  if (state == DONE && workoutComplete()) {
+    const char top[] = {'W', 'o', 'r', 'k', 'o', 'u', 't', ' ', 'd', 'o', 'n', 'e', '!', ' ', CH_STAR, ' ', 0};
+    strcpy(line1, top);
+    uint8_t phases = (wkReps > 0) ? 3 : 2;
+    uint8_t phase = (now / PROMPT_MS) % phases;
+    if (phases == 2) phase++;                 // no sensor reps: skip the reps line
+    if (phase == 0)      snprintf(line2, 17, "Good reps %u/%u", wkGood, wkReps);
+    else if (phase == 1) snprintf(line2, 17, "All %u exercises", exerciseCount);
+    else                 strcpy(line2, "tap=new round");
+    padTo16(line2);
     return;
   }
 
