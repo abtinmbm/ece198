@@ -15,8 +15,6 @@ Arduino UNO R4 Minima + Seeed Grove Base Shield (switch at 5V).
 | `docs/schematic.png` | Circuit schematic of the final build (`schematic.py` redraws it) |
 | `docs/photos/` | Photos of the finished build: top view, breadboard close-up, wrist sensor |
 | `docs/results/` | Real curl recording (CurlTest plotter data), its graph and the script that draws it |
-| `docs/presentation/` | Symposium slides (PowerPoint) |
-| `docs/drawings/` | Pin map, breadboard, sensor cable, base board and rep-rule drawings |
 
 ## Final build
 
@@ -37,7 +35,7 @@ Arduino UNO R4 Minima + Seeed Grove Base Shield (switch at 5V).
 | MMA7361 X / Y / Z | A0 / A1 / A2 |
 | MMA7361 5V / GND | 5V / GND next to Vin; SL jumpered to the sensor's 3V3 |
 
-See `docs/schematic.png` for the schematic and `docs/drawings/04_pin_map.png` for the pin map.
+See `docs/schematic.png` for the full schematic.
 
 ## Upload
 
