@@ -94,8 +94,14 @@ const uint16_t LCD_RETRY_MS    = 3000;
 const uint16_t DEBOUNCE_MS     = 30;
 const uint16_t LONG_PRESS_MS   = 800;
 const uint16_t HELD_REPORT_MS  = 5000;     // a press held this long is reported once
+const uint16_t TAP_GUARD_MS    = 1000;     // after a set ends, ignore taps this long, so one
+                                           // tap too many can't cut the rest or skip WELL DONE
 const uint16_t MESSAGE_MS      = 1200;
 const uint16_t WARNING_MS      = 3000;
+const uint16_t GOOD_MS         = 800;      // "Good!" after a good rep
+const uint16_t PROMPT_MS       = 1800;     // READY screen: how long each hint shows
+const uint16_t CELEBRATE_MS    = 3500;     // "WELL DONE!" animation after an exercise
+const uint16_t SCREEN_EVERY_MS = 50;       // redraw the screen at most this often
 
 const uint8_t MAX_EXERCISES = 30;
 const uint8_t NAME_LENGTH   = 16;          // fits one LCD line
@@ -133,10 +139,36 @@ const uint16_t BAD_FOR_MS     = 1000;   // bad this long  -> "Sensor?"
 const uint16_t GOOD_FOR_MS    = 500;    // good this long -> "Sensor OK"
 
 // ---------- saving "arm down" ----------
-const uint16_t ZERO_MS           = 500;   // average the hanging arm over this long
-const float    ZERO_MAX_SPREAD_G = 0.15;  // an axis moving more than this = arm not still
+const uint16_t ZERO_SETTLE_MS    = 300;   // ignore this long after the tap (tapping shakes the body)
+const uint16_t ZERO_MS           = 500;   // then the arm must be still for this long
+const uint16_t ZERO_GIVE_UP_MS   = 4000;  // keep waiting for a still moment this long, then "Tap again"
+const float    ZERO_MAX_SPREAD_G = 0.20;  // an axis moving more than this = arm not still
 const float    ZERO_MIN_G        = 0.8;   // a still arm reads close to 1 g in total
 const float    ZERO_MAX_G        = 1.2;
+
+// ---------- screen: custom characters and the angle bar ----------
+// The LCD has 8 slots for home-made characters. Slot 0 is not used, because a
+// character code of 0 would end a text string.
+const char CH_BAR1 = 1, CH_BAR2 = 2, CH_BAR3 = 3, CH_BAR4 = 4;  // bar cell with 1-4 columns lit
+const char CH_TARGET = 5;            // dotted line: the 100 degree target
+const char CH_DOWN   = 6;            // arrow pointing down
+const char CH_STAR   = 7;            // star for the celebration
+const char CH_FULL   = (char)0xFF;   // solid block, built into the LCD
+const char CH_DEGREE = (char)0xDF;   // degree sign, built into the LCD
+const uint8_t GLYPHS[7][8] = {       // 8 rows of 5 dots each; 1 = lit
+  {0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10},   // 1 column
+  {0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18},   // 2 columns
+  {0x1C, 0x1C, 0x1C, 0x1C, 0x1C, 0x1C, 0x1C, 0x1C},   // 3 columns
+  {0x1E, 0x1E, 0x1E, 0x1E, 0x1E, 0x1E, 0x1E, 0x1E},   // 4 columns
+  {0x10, 0x00, 0x10, 0x00, 0x10, 0x00, 0x10, 0x00},   // dotted target line
+  {0x04, 0x04, 0x04, 0x04, 0x15, 0x0E, 0x04, 0x00},   // down arrow
+  {0x04, 0x04, 0x1F, 0x0E, 0x0E, 0x1B, 0x11, 0x00},   // star
+};
+const float   BAR_FULL_DEG = 125.0;  // the 10-cell bar is full at 125 degrees (12.5 per cell)
+const uint8_t TARGET_CELL  = 8;      // 8 cells x 12.5 = 100 degrees: the target mark
+const uint8_t PARTY_COLOURS[6][3] = {
+  {255, 0, 0}, {255, 140, 0}, {255, 255, 0}, {0, 220, 60}, {0, 90, 255}, {170, 0, 255}
+};
 
 // ---------- types ----------
 enum Mode : uint8_t { TIMER, REPS, SENSOR };
@@ -208,6 +240,15 @@ uint32_t setStartedAt = 0;
 bool     extraRound = false;           // repeating an exercise already done
 uint32_t warningUntil = 0;
 SetStats stats;
+uint16_t exReps = 0;                   // reps counted in this exercise (all sets)
+uint16_t exGood = 0;                   // good sensor reps in this exercise
+uint16_t exTries = 0;                  // every rep tried: counted ones plus ones not counted
+uint16_t wkReps = 0;                   // whole workout: reps tried in finished sensor exercises
+uint16_t wkGood = 0;                   // of those, good reps (for the "Workout done!" screen)
+uint32_t celebrateUntil = 0;           // end of the "WELL DONE!" animation
+uint32_t tapsIgnoredUntil = 0;         // TAP pad and button A ignored until then
+char     shownLine[2][17];             // what is on the LCD now (for partial redraws)
+int      shownColour = -1;             // backlight colour now on the LCD
 
 bool     muted = false;
 const char *message = "";
@@ -240,7 +281,8 @@ const char *lastProblem = "";
 bool     haveRef = false;
 float    ref[3]  = {0, 0, 0};          // unit-length arrow: gravity direction with arm down
 bool     zeroing = false;
-uint32_t zeroStartedAt = 0;
+uint32_t zeroStartedAt = 0;             // when the tap happened
+uint32_t zeroWindowAt = 0;              // when the current still half-second began
 uint16_t zeroCount = 0;
 float    zeroSum[3], zeroMin[3], zeroMax[3];
 
@@ -262,9 +304,17 @@ const Exercise &current() { return workout[exerciseIndex]; }
 // Written further down; declared here so earlier functions can call them.
 void startZeroing();
 void finishSet();
+void forgetScreen();
 
 // True while the current exercise is a sensor exercise and a set is running.
 bool inSensorSet() { return exerciseCount > 0 && current().mode == SENSOR && state == RUNNING; }
+
+// True when every exercise in the plan has been finished this round.
+bool workoutComplete() {
+  if (exerciseCount == 0) return false;
+  for (uint8_t i = 0; i < exerciseCount; i++) if (!finished[i]) return false;
+  return true;
+}
 
 // True when the sensor can't be used for this set, so taps count the reps.
 bool countingByTaps() { return inSensorSet() && (!sensorOk || !haveRef); }
@@ -370,7 +420,9 @@ uint8_t readWorkout(bool keep, bool report) {
     strcpy(original, line);
     Exercise exercise;
     bool isExercise = false;
-    const char *problem = tooLong ? "line is too long" : parseLine(line, exercise, isExercise);
+    const char *problem;
+    if (tooLong) problem = (*trimSpaces(line) == '#') ? nullptr : "line is too long";  // a long comment is fine
+    else         problem = parseLine(line, exercise, isExercise);
 
     if (problem == nullptr && isExercise) {
       if (found >= MAX_EXERCISES) {
@@ -544,6 +596,8 @@ void goToExercise(int16_t index) {
   exerciseIndex = (uint8_t)index;
   setNumber = 1;
   extraRound = false;
+  exReps = exGood = exTries = 0;
+  celebrateUntil = 0;
   prepareSet();
   playSound(SOUND_CLICK);
 }
@@ -556,16 +610,42 @@ void nextSet() {
 void finishSet() {
   logRow(activityName(), setNumber, current().target, doneSoFar(), setSeconds(),
          extraRound ? "extra" : "ok", true);
+  exReps += doneSoFar();
+  exGood += stats.sensorReps - stats.tooFast;
+  exTries += doneSoFar() + stats.partial;
+  tapsIgnoredUntil = millis() + TAP_GUARD_MS;
   if (setNumber >= current().sets) {
     state = DONE;
     finished[exerciseIndex] = true;
+    if (current().mode == SENSOR) {           // add this exercise to the workout totals
+      wkReps += exTries;
+      wkGood += exGood;
+    }
+    celebrateUntil = millis() + CELEBRATE_MS;   // start the "WELL DONE!" screen
     playSound(SOUND_FINISH);
+    if (workoutComplete()) {
+      Serial.print(F("# Workout complete: all "));
+      Serial.print(exerciseCount);
+      Serial.print(F(" exercises done"));
+      if (wkReps > 0) {
+        Serial.print(F(", good reps "));
+        Serial.print(wkGood);
+        Serial.print('/');
+        Serial.print(wkReps);
+        Serial.print(F(" ("));
+        Serial.print(100UL * wkGood / wkReps);
+        Serial.print(F(" %)"));
+      }
+      Serial.println('.');
+    }
   } else if (current().rest > 0) {
     state = RESTING;
     startCountdown((uint32_t)current().rest * 1000UL);
+    showMessage("Set done!", MESSAGE_MS);
     playSound(SOUND_SET);
   } else {
     nextSet();
+    showMessage("Set done!", MESSAGE_MS);
     playSound(SOUND_SET);
   }
 }
@@ -694,7 +774,17 @@ void handleButtonA() {
       break;
     }
     case DONE:
-      goToExercise(exerciseIndex + 1);
+      if (exerciseIndex + 1 >= exerciseCount) {
+        // Whole workout done: start a fresh round from the top, so the
+        // exercises aren't all marked "Extra" (red LED on) the second time.
+        for (uint8_t i = 0; i < exerciseCount; i++) finished[i] = false;
+        wkReps = wkGood = 0;
+        Serial.println(F("# Workout complete. Starting a new round from the first exercise."));
+        goToExercise(0);
+        showMessage("New round", MESSAGE_MS);
+      } else {
+        goToExercise(exerciseIndex + 1);
+      }
       break;
   }
 }
@@ -711,6 +801,8 @@ void handleButtonC(Press press) {
     logIfLeftEarly();
     setNumber = 1;
     extraRound = false;
+    exReps = exGood = exTries = 0;
+    celebrateUntil = 0;
     prepareSet();
     showMessage("Restarted", MESSAGE_MS);
   }
@@ -832,41 +924,65 @@ void updateSpeed(bool valid, uint32_t now) {
 }
 
 // ---------- saving "arm down" ----------
-void startZeroing() {
-  zeroing = true;
-  zeroStartedAt = millis();
+// Starts a fresh half-second of readings.
+void restartZeroWindow(uint32_t now) {
+  zeroWindowAt = now;
   zeroCount = 0;
   for (uint8_t axis = 0; axis < 3; axis++) {
     zeroSum[axis] = 0;
     zeroMin[axis] = 99;
     zeroMax[axis] = -99;
   }
-  showMessage("Arm down", ZERO_MS + 300);
 }
 
-// Called with every reading while saving. Uses the unsmoothed readings so the
+void startZeroing() {
+  zeroing = true;
+  zeroStartedAt = millis();
+  restartZeroWindow(zeroStartedAt);
+}
+
+// Called with every reading while saving. It waits 0.3 s for the tap's shake to
+// settle, then needs half a second of a still arm. If the arm moves, that half
+// second starts again, for up to 4 s. Uses the unsmoothed readings so the
 // smoothing delay doesn't leak the tap movement into the saved position.
 void updateZeroing(uint32_t now) {
+  if (now - zeroStartedAt < ZERO_SETTLE_MS) {
+    restartZeroWindow(now);             // still settling after the tap
+    return;
+  }
+  float spread = 0;
   for (uint8_t axis = 0; axis < 3; axis++) {
     zeroSum[axis] += rawG[axis];
     zeroMin[axis] = fminf(zeroMin[axis], rawG[axis]);
     zeroMax[axis] = fmaxf(zeroMax[axis], rawG[axis]);
+    spread = fmaxf(spread, zeroMax[axis] - zeroMin[axis]);
   }
   zeroCount++;
-  if (now - zeroStartedAt < ZERO_MS) return;
+
+  if (spread > ZERO_MAX_SPREAD_G) {     // the arm moved
+    if (now - zeroStartedAt >= ZERO_GIVE_UP_MS) {
+      zeroing = false;
+      Serial.print(F("# Arm down NOT saved: the arm kept moving for 4 s (moved "));
+      Serial.print(spread, 2);
+      Serial.println(F(" g). Let it hang still and tap again."));
+      warn("Tap again");
+      return;                           // stays READY: the next tap tries again
+    }
+    restartZeroWindow(now);             // start the still half-second again
+    return;
+  }
+  if (now - zeroWindowAt < ZERO_MS) return;
   zeroing = false;
 
   float average[3];
-  float spread = 0;
-  for (uint8_t axis = 0; axis < 3; axis++) {
-    average[axis] = zeroSum[axis] / zeroCount;
-    spread = fmaxf(spread, zeroMax[axis] - zeroMin[axis]);
-  }
+  for (uint8_t axis = 0; axis < 3; axis++) average[axis] = zeroSum[axis] / zeroCount;
   float total = lengthOf(average);
-  if (spread > ZERO_MAX_SPREAD_G || total < ZERO_MIN_G || total > ZERO_MAX_G) {
-    Serial.println(F("# Arm down NOT saved: arm moved, or total not near 1 g. Tap again."));
+  if (total < ZERO_MIN_G || total > ZERO_MAX_G) {
+    Serial.print(F("# Arm down NOT saved: total was "));
+    Serial.print(total, 2);
+    Serial.println(F(" g, expected about 1.00 g when still. Check the sensor wiring."));
     warn("Tap again");
-    return;                             // stays READY: the next tap tries again
+    return;
   }
   for (uint8_t axis = 0; axis < 3; axis++) ref[axis] = average[axis] / total;
   haveRef = true;
@@ -944,6 +1060,7 @@ void handleRep(RepResult result) {
       repCount++;
       stats.sensorReps++;
       playSound(SOUND_TICK);
+      showMessage("Good!", GOOD_MS);
       printRepLine(F("good,"));
       break;
     case REP_TOO_FAST:
@@ -1064,8 +1181,8 @@ bool probeI2C(uint8_t address) {
   return false;
 }
 
-void lcdCommand(uint8_t command) { i2cWrite(LCD_TEXT_ADDRESS, 0x80, command); }
-void lcdCharacter(char c)        { i2cWrite(LCD_TEXT_ADDRESS, 0x40, (uint8_t)c); }
+bool lcdCommand(uint8_t command) { return i2cWrite(LCD_TEXT_ADDRESS, 0x80, command); }
+bool lcdCharacter(char c)        { return i2cWrite(LCD_TEXT_ADDRESS, 0x40, (uint8_t)c); }
 
 void lcdClear() {
   lcdCommand(0x01);
@@ -1075,6 +1192,15 @@ void lcdClear() {
 void lcdPrintLine(uint8_t row, const char *text) {
   lcdCommand(row == 0 ? 0x80 : 0xC0);
   while (*text != 0) lcdCharacter(*text++);
+}
+
+// Draws the 7 custom characters into the LCD's character memory (slots 1-7).
+// Each is 8 rows of 5 dots; a 1 bit is a lit dot.
+void lcdDefineChars() {
+  for (uint8_t slot = 1; slot <= 7; slot++) {
+    lcdCommand(0x40 | (slot << 3));              // point at that slot's memory
+    for (uint8_t row = 0; row < 8; row++) lcdCharacter((char)GLYPHS[slot - 1][row]);
+  }
 }
 
 void writeLight(uint8_t reg, uint8_t value) { i2cWrite(LCD_LIGHT_ADDRESS, reg, value); }
@@ -1094,12 +1220,36 @@ void startLcd() {
   lcdCommand(0x0C);                   // display on, no cursor
   lcdClear();
   lcdCommand(0x06);                   // text runs left to right
+  lcdDefineChars();
 
   writeLight(0x00, 0x00);             // wake the backlight chip
   writeLight(0x08, 0xFF);             // LED outputs on
-  writeLight(0x01, 0x20);
+  writeLight(0x01, 0x20);             // backlight chip's output setting
   setColor(0, 90, 255);
-  lcdPrintLine(0, "Exercise Tracker");
+  const char splash[] = {' ', ' ', ' ', 'L', 'e', 't', '\'', 's', ' ', 'm', 'o', 'v', 'e', '!', ' ', CH_STAR, 0};
+  lcdPrintLine(0, "   Dose Coach   ");
+  lcdPrintLine(1, splash);
+}
+
+// Sends the LCD its settings, custom characters and backlight setup again,
+// without clearing it or waiting. Brings the screen back after an unplug or a
+// glitch; the next screen update then redraws every character (about 0.1 s).
+void lcdRefresh() {
+  for (uint8_t i = 0; i < 3; i++) lcdCommand(0x28);   // two lines, normal font
+  lcdCommand(0x0C);                   // display on, no cursor
+  lcdCommand(0x06);                   // text runs left to right
+  lcdDefineChars();
+  writeLight(0x00, 0x00);             // wake the backlight chip
+  writeLight(0x08, 0xFF);             // LED outputs on
+  writeLight(0x01, 0x20);             // backlight chip's output setting
+  forgetScreen();
+}
+
+// Forgets what is on the screen, so the next update redraws all of it
+// (used after the LCD is started again).
+void forgetScreen() {
+  memset(shownLine, 0, sizeof shownLine);
+  shownColour = -1;
 }
 
 void setBacklight() {
@@ -1121,54 +1271,184 @@ void showNoWorkout() {
   lcdPrintLine(1, "Check workout.h ");
 }
 
-void updateScreen() {
-  if (!lcdFound) return;
+// True for the first few seconds after an exercise is finished: the party screen.
+bool celebrating() { return state == DONE && (int32_t)(millis() - celebrateUntil) < 0; }
 
-  static int lastState = -1;
-  if (state != lastState) {
-    lastState = state;
-    setBacklight();
+// Writes only the characters that changed since the last update. Each character
+// takes about 1 ms with the hand-made I2C, so this keeps the live bar quick.
+// Returns false if the LCD stopped answering.
+bool lcdShowRow(uint8_t row, const char *text) {
+  int8_t cursor = -1;                           // where the LCD will write next
+  for (uint8_t i = 0; i < 16; i++) {
+    if (text[i] == shownLine[row][i]) continue;
+    if (cursor != (int8_t)i && !lcdCommand((row == 0 ? 0x80 : 0xC0) + i)) return false;
+    if (!lcdCharacter(text[i])) return false;
+    shownLine[row][i] = text[i];
+    cursor = i + 1;
+  }
+  return true;
+}
+
+// Line 1 during a sensor set: a bar of 10 cells that fills as the arm comes up
+// (full at 125 degrees), a dotted mark at the 100 degree target, then the angle.
+void angleBarLine(char *out) {
+  float angle = angleDeg < 0 ? 0 : angleDeg;
+  uint8_t columns = (uint8_t)(angle * 50 / BAR_FULL_DEG + 0.5);   // 5 dot-columns per cell
+  if (columns > 50) columns = 50;
+  for (uint8_t cell = 0; cell < 10; cell++) {
+    uint8_t filled = columns > cell * 5 ? columns - cell * 5 : 0;
+    if (filled >= 5)      out[cell] = CH_FULL;
+    else if (filled > 0)  out[cell] = (char)(CH_BAR1 + filled - 1);   // 1-4 columns lit
+    else                  out[cell] = (cell == TARGET_CELL) ? CH_TARGET : ' ';
+  }
+  snprintf(out + 10, 7, "  %3u", (unsigned)(angle + 0.5));        // fills positions 10-14
+  out[15] = CH_DEGREE;
+  out[16] = 0;
+}
+
+// Fills a screen line with spaces up to the full 16 characters.
+void padTo16(char *line) {
+  size_t length = strlen(line);
+  while (length < 16) line[length++] = ' ';
+  line[16] = 0;
+}
+
+// Works out both screen lines for the current state.
+void buildScreen(char *line1, char *line2, uint32_t now) {
+  const Exercise &e = current();
+  snprintf(line1, 17, "%-16.16s", e.name);
+
+  // ---- finished: "WELL DONE!" with blinking stars, a row of stars, then a summary
+  if (celebrating()) {
+    uint32_t age = CELEBRATE_MS - (celebrateUntil - now);       // ms since it started
+    char star = ((now / 300) % 2 == 0) ? CH_STAR : ' ';
+    const char top[] = {' ', star, ' ', 'W', 'E', 'L', 'L', ' ', 'D', 'O', 'N', 'E', '!', ' ', star, ' ', 0};
+    strcpy(line1, top);
+    uint8_t stars = (uint8_t)(age / 100);                       // one more star every 0.1 s
+    if (stars < 16) {
+      for (uint8_t i = 0; i < 16; i++) line2[i] = (i < stars) ? CH_STAR : ' ';
+      line2[16] = 0;
+    } else if (e.mode == TIMER) {
+      snprintf(line2, 17, "%u set%s done     ", e.sets, e.sets == 1 ? "" : "s");
+    } else if (e.mode == SENSOR) {
+      snprintf(line2, 17, "%u good of %u     ", exGood, exTries);   // out of every rep tried
+    } else {
+      snprintf(line2, 17, "%u reps done      ", exReps);
+    }
+    return;
   }
 
+  // ---- whole plan finished: a summary, taking turns with what to do next
+  if (state == DONE && workoutComplete()) {
+    const char top[] = {'W', 'o', 'r', 'k', 'o', 'u', 't', ' ', 'd', 'o', 'n', 'e', '!', ' ', CH_STAR, ' ', 0};
+    strcpy(line1, top);
+    uint8_t phases = (wkReps > 0) ? 3 : 2;
+    uint8_t phase = (now / PROMPT_MS) % phases;
+    if (phases == 2) phase++;                 // no sensor reps: skip the reps line
+    if (phase == 0)      snprintf(line2, 17, "Good reps %u/%u", wkGood, wkReps);
+    else if (phase == 1) snprintf(line2, 17, "All %u exercises", exerciseCount);
+    else                 strcpy(line2, "tap=new round");
+    padTo16(line2);
+    return;
+  }
+
+  // ---- saving "arm down": a progress bar while the arm must stay still
+  if (state == READY && zeroing) {
+    strcpy(line1, "Hold still...   ");
+    uint8_t cells = zeroCount == 0 ? 0 : (uint8_t)((now - zeroWindowAt) * 16 / ZERO_MS);
+    if (cells > 16) cells = 16;
+    for (uint8_t i = 0; i < 16; i++) line2[i] = (i < cells) ? CH_FULL : '.';
+    line2[16] = 0;
+    return;
+  }
+
+  bool messageShowing = (int32_t)(now - messageUntil) < 0;
+
+  // ---- waiting to start: hints take turns with the normal line
+  if (state == READY && !messageShowing) {
+    uint8_t phase = (now / PROMPT_MS) % 3;
+    if (phase == 1) {
+      if (e.mode == SENSOR) {
+        const char hint[] = {'A', 'r', 'm', ' ', 's', 't', 'r', 'a', 'i', 'g', 'h', 't', ' ', CH_DOWN, ' ', ' ', 0};
+        strcpy(line2, hint);
+      } else if (e.mode == REPS) {
+        strcpy(line2, "Tap the pad for ");
+      } else {
+        strcpy(line2, "Tap the pad to  ");
+      }
+      return;
+    }
+    if (phase == 2) {
+      if (e.mode == SENSOR)    strcpy(line2, "then tap the pad");
+      else if (e.mode == REPS) strcpy(line2, "every rep you do");
+      else                     strcpy(line2, "start the timer ");
+      return;
+    }
+  }
+
+  // ---- normal line: value on the left, status on the right
   char value[8] = "";
   char status[10] = "";
-  uint16_t seconds = 0;
-
   if (state == DONE) {
     strcpy(value, "DONE");
-    strcpy(status, "A: next");
-  } else if (state == RESTING || state == PAUSED || current().mode == TIMER) {
-    seconds = (state == READY) ? current().target : secondsLeft();
+    strcpy(status, "tap=next");
+  } else if (state == RESTING || state == PAUSED || e.mode == TIMER) {
+    uint16_t seconds = (state == READY) ? e.target : secondsLeft();
     snprintf(value, sizeof value, "%02u:%02u", seconds / 60, seconds % 60);
   } else {
-    snprintf(value, sizeof value, "%u/%u", repCount, current().target);
+    snprintf(value, sizeof value, "%u/%u", repCount, e.target);
   }
 
   if (state == RESTING) {
-    snprintf(status, sizeof status, "REST>S%u", setNumber + 1);
+    snprintf(line1, 17, setNumber + 1 < 10 ? "Rest, then set %u" : "Rest > set %u", setNumber + 1);
+    strcpy(status, "tap=skip");
   } else if (state == PAUSED) {
     strcpy(status, "PAUSED");
   } else if (countingByTaps()) {
     strcpy(status, "Tap reps");               // sensor set, but taps are counting
   } else if (state != DONE) {
-    snprintf(status, sizeof status, extraRound ? "Extra %u/%u" : "Set %u/%u",
-             setNumber, current().sets);
+    // "Extra 1/2" fits the 9-character status area; from 10 sets on, "Ext 10/12".
+    snprintf(status, sizeof status, !extraRound ? "Set %u/%u" : (e.sets < 10 ? "Extra %u/%u" : "Ext %u/%u"),
+             setNumber, e.sets);
+  }
+  if (state == READY && e.mode == SENSOR && !sensorOk) strcpy(status, "Sensor?");  // warn before the tap
+
+  // During a sensor set the top line becomes the live angle bar.
+  if (inSensorSet() && sensorOk && haveRef) angleBarLine(line1);
+
+  if (messageShowing) snprintf(status, sizeof status, "%s", message);
+  snprintf(line2, 17, "%-7.7s%9.9s", value, status);
+}
+
+void updateScreen() {
+  if (!lcdFound) return;
+  uint32_t now = millis();
+
+  // Backlight: one colour per state, or cycling through colours while celebrating.
+  int colour = state;
+  if (celebrating()) colour = 10 + (now / 250) % 6;
+  if (colour != shownColour) {
+    shownColour = colour;
+    if (colour >= 10) {
+      const uint8_t *c = PARTY_COLOURS[colour - 10];
+      setColor(c[0], c[1], c[2]);
+    } else {
+      setBacklight();
+    }
   }
 
-  if ((int32_t)(millis() - messageUntil) < 0) {
-    snprintf(status, sizeof status, "%s", message);
-  }
+  // Redraw at most every 50 ms; screen writes are slow with hand-made I2C.
+  static uint32_t lastDraw = 0;
+  if (now - lastDraw < SCREEN_EVERY_MS) return;
+  lastDraw = now;
 
   char line1[17], line2[17];
-  snprintf(line1, sizeof line1, "%-16.16s", current().name);
-  snprintf(line2, sizeof line2, "%-7.7s%9.9s", value, status);
-
-  static char shown1[17] = "", shown2[17] = "";
-  if (strcmp(line1, shown1) != 0 || strcmp(line2, shown2) != 0) {
-    strcpy(shown1, line1);
-    strcpy(shown2, line2);
-    lcdPrintLine(0, line1);
-    lcdPrintLine(1, line2);
+  buildScreen(line1, line2, now);
+  padTo16(line1);
+  padTo16(line2);
+  if (!lcdShowRow(0, line1) || !lcdShowRow(1, line2)) {
+    lcdFound = false;                         // loop() will retry every 3 s
+    Serial.println(F("# LCD stopped answering (loose cable?). Retrying every 3 s."));
   }
 }
 
@@ -1184,7 +1464,7 @@ void printProbes() {
 }
 
 void printReport() {
-  Serial.println(F("# --- Exercise Tracker ---"));
+  Serial.println(F("# --- Dose Coach (Exercise Tracker) ---"));
   printProbes();
 
   if (!USE_TOUCH) {
@@ -1196,12 +1476,14 @@ void printReport() {
     Serial.println(F("# TAP pad: looks plugged in."));
   }
 
-  Serial.print(sensorOk ? F("# Wrist sensor: OK | ") : F("# Wrist sensor: NOT OK | "));
-  printSensorValues();
-  if (!sensorOk) {
-    Serial.print(F("#   reason: "));
-    Serial.println(lastProblem);
-    Serial.println(F("#   Sensor exercises will count taps until it reads OK."));
+  if (exerciseCount > 0) {             // the sensor is only read when there are exercises
+    Serial.print(sensorOk ? F("# Wrist sensor: OK | ") : F("# Wrist sensor: NOT OK | "));
+    printSensorValues();
+    if (!sensorOk) {
+      Serial.print(F("#   reason: "));
+      Serial.println(lastProblem);
+      Serial.println(F("#   Sensor exercises will count taps until it reads OK."));
+    }
   }
   Serial.print(F("# Rep rules: start above "));
   Serial.print(REP_START_DEG, 0);
@@ -1261,19 +1543,29 @@ void setup() {
     updateLights();
   }
   if (lcdFound) lcdClear();
+  forgetScreen();
 }
 
 void loop() {
-  // Keeps checking until the LCD answers, and reports each try.
+  // LCD check every 3 s. Missing: try again (and report each try). Present: make
+  // sure it still answers, and send its settings again, because a loose cable or
+  // a quick glitch resets the LCD to a blank, dark screen even if it answers.
+  // The resend is skipped during a sensor set, where it would cost readings.
   static uint32_t lastCheck = 0;
-  if (!lcdFound && millis() - lastCheck >= LCD_RETRY_MS) {
+  if (millis() - lastCheck >= LCD_RETRY_MS) {
     lastCheck = millis();
-    printProbes();
-    if (probeI2C(LCD_TEXT_ADDRESS)) {
-      lcdFound = true;
-      startLcd();
-      delay(1000);
-      lcdClear();
+    if (!lcdFound) {
+      printProbes();
+      if (probeI2C(LCD_TEXT_ADDRESS)) {
+        lcdFound = true;
+        lcdRefresh();
+        Serial.println(F("# LCD found again."));
+      }
+    } else if (!probeI2C(LCD_TEXT_ADDRESS)) {
+      lcdFound = false;
+      Serial.println(F("# LCD stopped answering (loose cable?). Retrying every 3 s."));
+    } else if (!inSensorSet() && !zeroing) {
+      lcdRefresh();
     }
   }
 
@@ -1294,13 +1586,16 @@ void loop() {
     return;
   }
 
-  // The TAP pad and button A do exactly the same thing.
+  // The TAP pad and button A do exactly the same thing. Both are still read
+  // during the guard time after a set (to keep their debouncing right), but
+  // their taps are ignored then.
+  bool tapsAllowed = (int32_t)(millis() - tapsIgnoredUntil) >= 0;
   Press a = readButton(btnA);
-  if (a == SHORT_PRESS || a == LONG_PRESS) handleButtonA();
+  if ((a == SHORT_PRESS || a == LONG_PRESS) && tapsAllowed) handleButtonA();
 
   if (USE_TOUCH) {
     Press pad = readButton(btnPad);
-    if (pad == SHORT_PRESS || pad == LONG_PRESS) handleButtonA();
+    if ((pad == SHORT_PRESS || pad == LONG_PRESS) && tapsAllowed) handleButtonA();
   }
 
   Press b = readButton(btnB);

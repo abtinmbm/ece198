@@ -23,8 +23,9 @@
  *      The startup check says whether "total" is close to 1.00 g.
  *      (If it is outside 0.90-1.10 g while still, use the backup 3.3V wiring.)
  *   2. Let the arm hang straight down, then tap the TAP pad (or press A)
- *      with the OTHER hand. Hold still for half a second: that position
- *      becomes 0 degrees and the counts reset.
+ *      with the OTHER hand. Hold still for about a second (it waits 0.3 s for
+ *      the tap's wobble, then needs 0.5 s of stillness): that position becomes
+ *      0 degrees and the counts reset.
  *   3. Do curls. One line is printed for every movement:
  *        GOOD       reached 100 deg and took 1.5 s or more   (counted)
  *        TOO FAST   reached 100 deg but took under 1.5 s     (counted, flagged)
@@ -94,8 +95,10 @@ const uint16_t BAD_FOR_MS      = 1000;  // bad for this long  -> "Sensor?"
 const uint16_t GOOD_FOR_MS     = 500;   // good for this long -> "Sensor OK"
 
 // ---------- saving "arm down" ----------
-const uint16_t ZERO_MS           = 500;   // average the hanging arm over this long
-const float    ZERO_MAX_SPREAD_G = 0.15;  // an axis moving more than this = arm not still
+const uint16_t ZERO_SETTLE_MS    = 300;   // ignore this long after the tap (tapping shakes the body)
+const uint16_t ZERO_MS           = 500;   // then the arm must be still for this long
+const uint16_t ZERO_GIVE_UP_MS   = 4000;  // keep waiting for a still moment this long, then give up
+const float    ZERO_MAX_SPREAD_G = 0.20;  // an axis moving more than this = arm not still
 const float    ZERO_MIN_G        = 0.8;   // a still arm must read close to 1 g in total
 const float    ZERO_MAX_G        = 1.2;
 
@@ -148,7 +151,8 @@ const char *lastProblem = "no readings yet";
 bool     haveRef = false;
 float    ref[3]  = {0, 0, 0};      // unit-length arrow: gravity direction with arm down
 bool     zeroing = false;
-uint32_t zeroStartedAt = 0;
+uint32_t zeroStartedAt = 0;             // when the tap happened
+uint32_t zeroWindowAt = 0;              // when the current still half-second began
 uint16_t zeroCount = 0;
 float    zeroSum[3], zeroMin[3], zeroMax[3];
 
@@ -180,6 +184,7 @@ uint32_t lastStatusAt = 0;
 bool talk() { return !PLOTTER_MODE; }
 
 void printStartupCheck();          // written further down
+void restartZeroWindow(uint32_t now);
 
 // ---------- inputs ----------
 // Returns true once, at the moment a new press starts (after debouncing).
@@ -318,13 +323,19 @@ void startZeroing(uint32_t now) {
   }
   zeroing = true;
   zeroStartedAt = now;
+  restartZeroWindow(now);
+  if (talk()) Serial.println(F("# Hold still... saving arm down"));
+}
+
+// Starts a fresh half-second of readings.
+void restartZeroWindow(uint32_t now) {
+  zeroWindowAt = now;
   zeroCount = 0;
   for (uint8_t axis = 0; axis < 3; axis++) {
     zeroSum[axis] = 0;
     zeroMin[axis] = 99;
     zeroMax[axis] = -99;
   }
-  if (talk()) Serial.println(F("# Hold still... saving arm down"));
 }
 
 void resetCounts() {
@@ -332,30 +343,43 @@ void resetCounts() {
   moveNumber = goodReps = fastReps = fastLowReps = lowReps = bumps = 0;
 }
 
-// Called with every reading while saving. Uses the unsmoothed readings so the
+// Called with every reading while saving. It waits 0.3 s for the tap's shake to
+// settle, then needs half a second of a still arm. If the arm moves, that half
+// second starts again, for up to 4 s. Uses the unsmoothed readings so the
 // smoothing delay doesn't leak the tap movement into the saved position.
 void updateZeroing(uint32_t now) {
+  if (now - zeroStartedAt < ZERO_SETTLE_MS) {
+    restartZeroWindow(now);             // still settling after the tap
+    return;
+  }
+  float spread = 0;
   for (uint8_t axis = 0; axis < 3; axis++) {
     zeroSum[axis] += rawG[axis];
     zeroMin[axis] = fminf(zeroMin[axis], rawG[axis]);
     zeroMax[axis] = fmaxf(zeroMax[axis], rawG[axis]);
+    spread = fmaxf(spread, zeroMax[axis] - zeroMin[axis]);
   }
   zeroCount++;
-  if (now - zeroStartedAt < ZERO_MS) return;
+
+  if (spread > ZERO_MAX_SPREAD_G) {     // the arm moved
+    if (now - zeroStartedAt >= ZERO_GIVE_UP_MS) {
+      zeroing = false;
+      if (talk()) {
+        Serial.print(F("# Not saved: the arm kept moving for 4 s (moved "));
+        Serial.print(spread, 2);
+        Serial.println(F(" g). Let it hang still and tap again."));
+      }
+      return;
+    }
+    restartZeroWindow(now);             // start the still half-second again
+    return;
+  }
+  if (now - zeroWindowAt < ZERO_MS) return;
   zeroing = false;
 
   float average[3];
-  float spread = 0;
-  for (uint8_t axis = 0; axis < 3; axis++) {
-    average[axis] = zeroSum[axis] / zeroCount;
-    spread = fmaxf(spread, zeroMax[axis] - zeroMin[axis]);
-  }
+  for (uint8_t axis = 0; axis < 3; axis++) average[axis] = zeroSum[axis] / zeroCount;
   float total = lengthOf(average);
-
-  if (spread > ZERO_MAX_SPREAD_G) {
-    if (talk()) Serial.println(F("# Arm moved while saving. Hold still and tap again."));
-    return;
-  }
   if (total < ZERO_MIN_G || total > ZERO_MAX_G) {
     if (talk()) {
       Serial.print(F("# Not saved: total was "));
@@ -371,7 +395,6 @@ void updateZeroing(uint32_t now) {
 }
 
 // ---------- rep checker ----------
-// Called with every new angle. Returns what happened when a movement ends.
 // Arm speed: change in angle over the last 3 readings (60 ms), steadier than 1.
 // When the angle can't be trusted (sensor problem, no "arm down" yet), the memory
 // is filled with the current angle so the next real reading doesn't look like a jump.
@@ -387,6 +410,7 @@ void updateSpeed(bool valid) {
   armSpeed = fabsf(angleDeg - oldest) / (3 * READ_EVERY_MS / 1000.0);
 }
 
+// Called with every new angle. Returns what happened when a movement ends.
 RepResult checkRep(float angle, float speed, uint32_t now) {
   if (!armUp) {
     if (angle < REP_END_DEG) lastBelowEndAt = now;
